@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
+use std::ffi::{c_int, CStr};
 use std::io;
 use std::iter::FromIterator;
 use std::mem;
@@ -10,29 +10,30 @@ use std::str::FromStr;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use winapi::ctypes::{c_char, c_int};
-use winapi::shared::inaddr::*;
-use winapi::shared::minwindef::DWORD;
-use winapi::shared::minwindef::{INT, LPDWORD};
-use winapi::shared::winerror::ERROR_BUFFER_OVERFLOW;
-use winapi::shared::ws2def::LPWSAMSG;
-use winapi::shared::ws2def::*;
-use winapi::shared::ws2ipdef::*;
-use winapi::um::iptypes;
-use winapi::um::mswsock::{LPFN_WSARECVMSG, LPFN_WSASENDMSG, WSAID_WSARECVMSG, WSAID_WSASENDMSG};
-use winapi::um::winsock2 as sock;
-use winapi::um::winsock2::{LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE, SOCKET};
+use windows::core::{GUID, PSTR};
+use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
+use windows::Win32::Networking::WinSock::{
+    self as sock, CMSGHDR, IN_ADDR, IN_ADDR_0, IN_PKTINFO, IPPROTO_IP, IP_PKTINFO, LPFN_WSARECVMSG,
+    LPFN_WSASENDMSG, LPWSAOVERLAPPED_COMPLETION_ROUTINE, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    SOCKADDR, SOCKET, WSABUF, WSAID_WSARECVMSG, WSAMSG,
+};
+use windows::Win32::System::IO::OVERLAPPED;
+
+// missing in windows-rs for some reason
+const WSAID_WSASENDMSG: GUID = GUID::from_u128(0xa441e712_754f_43ca_84a7_0dee44cf606d);
 
 fn last_error() -> io::Error {
-    io::Error::from_raw_os_error(unsafe { sock::WSAGetLastError() })
+    io::Error::from_raw_os_error(unsafe { sock::WSAGetLastError().0 })
 }
 
 unsafe fn setsockopt<T>(socket: RawSocket, opt: c_int, val: c_int, payload: T) -> io::Result<()>
 where
     T: Copy,
 {
-    let payload = &payload as *const T as *const c_char;
-    if sock::setsockopt(socket as _, opt, val, payload, mem::size_of::<T>() as c_int) == 0 {
+    let payload = &payload as *const T as *const u8;
+    let payload = std::slice::from_raw_parts(payload, mem::size_of::<T>());
+    if sock::setsockopt(SOCKET(socket as _), opt, val, Some(payload)) == 0 {
         Ok(())
     } else {
         Err(last_error())
@@ -41,11 +42,11 @@ where
 
 type WSARecvMsgExtension = unsafe extern "system" fn(
     s: SOCKET,
-    lpMsg: LPWSAMSG,
-    lpdwNumberOfBytesRecvd: LPDWORD,
-    lpOverlapped: LPWSAOVERLAPPED,
-    lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
-) -> INT;
+    lpmsg: *mut WSAMSG,
+    lpdwnumberofbytesrecvd: *mut u32,
+    lpoverlapped: *mut OVERLAPPED,
+    lpcompletionroutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32;
 
 fn locate_wsarecvmsg(socket: RawSocket) -> io::Result<WSARecvMsgExtension> {
     let mut fn_pointer: usize = 0;
@@ -53,14 +54,14 @@ fn locate_wsarecvmsg(socket: RawSocket) -> io::Result<WSARecvMsgExtension> {
 
     let r = unsafe {
         sock::WSAIoctl(
-            socket as _,
+            SOCKET(socket as _),
             SIO_GET_EXTENSION_FUNCTION_POINTER,
-            &WSAID_WSARECVMSG as *const _ as *mut _,
-            mem::size_of_val(&WSAID_WSARECVMSG) as DWORD,
-            &mut fn_pointer as *const _ as *mut _,
-            mem::size_of_val(&fn_pointer) as DWORD,
+            Some(&WSAID_WSARECVMSG as *const _ as *const _),
+            mem::size_of_val(&WSAID_WSARECVMSG) as u32,
+            Some(&mut fn_pointer as *const _ as *mut _),
+            mem::size_of_val(&fn_pointer) as u32,
             &mut byte_len,
-            ptr::null_mut(),
+            None,
             None,
         )
     };
@@ -87,12 +88,12 @@ fn locate_wsarecvmsg(socket: RawSocket) -> io::Result<WSARecvMsgExtension> {
 
 type WSASendMsgExtension = unsafe extern "system" fn(
     s: SOCKET,
-    lpMsg: LPWSAMSG,
-    dwFlags: DWORD,
-    lpNumberOfBytesSent: LPDWORD,
-    lpOverlapped: LPWSAOVERLAPPED,
+    lpMsg: *const WSAMSG,
+    dwFlags: u32,
+    lpNumberOfBytesSent: *mut u32,
+    lpOverlapped: *mut OVERLAPPED,
     lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
-) -> INT;
+) -> i32;
 
 fn locate_wsasendmsg(socket: RawSocket) -> io::Result<WSASendMsgExtension> {
     let mut fn_pointer: usize = 0;
@@ -100,14 +101,14 @@ fn locate_wsasendmsg(socket: RawSocket) -> io::Result<WSASendMsgExtension> {
 
     let r = unsafe {
         sock::WSAIoctl(
-            socket as _,
+            SOCKET(socket as _),
             SIO_GET_EXTENSION_FUNCTION_POINTER,
-            &WSAID_WSASENDMSG as *const _ as *mut _,
-            mem::size_of_val(&WSAID_WSASENDMSG) as DWORD,
-            &mut fn_pointer as *const _ as *mut _,
-            mem::size_of_val(&fn_pointer) as DWORD,
+            Some(&WSAID_WSASENDMSG as *const _ as *const _),
+            mem::size_of_val(&WSAID_WSASENDMSG) as u32,
+            Some(&mut fn_pointer as *const _ as *mut _),
+            mem::size_of_val(&fn_pointer) as u32,
             &mut byte_len,
-            ptr::null_mut(),
+            None,
             None,
         )
     };
@@ -133,7 +134,7 @@ fn locate_wsasendmsg(socket: RawSocket) -> io::Result<WSASendMsgExtension> {
 }
 
 fn set_pktinfo(socket: RawSocket, payload: bool) -> io::Result<()> {
-    unsafe { setsockopt(socket, IPPROTO_IP, IP_PKTINFO, payload as c_int) }
+    unsafe { setsockopt(socket, IPPROTO_IP.0, IP_PKTINFO, payload as c_int) }
 }
 
 fn create_on_interfaces(
@@ -153,7 +154,7 @@ fn create_on_interfaces(
 
     // Join multicast listeners on every interface passed
     for interface in &interfaces {
-        socket.join_multicast_v4(multicast_address.ip(), &interface)?;
+        socket.join_multicast_v4(multicast_address.ip(), interface)?;
     }
 
     // On Windows, unlike all Unix variants, it is improper to bind to the multicast address
@@ -174,15 +175,16 @@ fn create_on_interfaces(
 
 fn build_address_table(interfaces: HashSet<Ipv4Addr>) -> io::Result<HashMap<u32, Ipv4Addr>> {
     let mut size = 0u32;
-    let r = unsafe { winapi::um::iphlpapi::GetAdaptersInfo(ptr::null_mut(), &mut size) };
-    if r != ERROR_BUFFER_OVERFLOW {
+    let r = unsafe { GetAdaptersInfo(None, &mut size) };
+    if r != ERROR_BUFFER_OVERFLOW.0 {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0; mem::size_of::<iptypes::IP_ADAPTER_INFO>() * (size as usize)];
-    let mut adapter_info = buffer.as_mut_ptr() as iptypes::PIP_ADAPTER_INFO;
+    let mut buffer =
+        vec![0; mem::size_of::<IP_ADAPTER_INFO>() * interfaces.len() * (size as usize)];
+    let mut adapter_info = buffer.as_mut_ptr() as *mut IP_ADAPTER_INFO;
     let mut size = buffer.len() as u32;
-    let r = unsafe { winapi::um::iphlpapi::GetAdaptersInfo(adapter_info, &mut size) };
+    let r = unsafe { GetAdaptersInfo(Some(adapter_info), &mut size) };
 
     if r != 0 {
         return Err(io::Error::last_os_error());
@@ -194,11 +196,12 @@ fn build_address_table(interfaces: HashSet<Ipv4Addr>) -> io::Result<HashMap<u32,
             break;
         }
 
-        let current: iptypes::IP_ADAPTER_INFO = unsafe { *adapter_info };
+        let current: IP_ADAPTER_INFO = unsafe { *adapter_info };
         let ip_address =
-            unsafe { CStr::from_ptr(current.IpAddressList.IpAddress.String.as_ptr()) }.to_str();
+            unsafe { CStr::from_ptr(current.IpAddressList.IpAddress.String.as_ptr() as *const i8) }
+                .to_str();
         let ip_address = match ip_address {
-            Ok(i) => Ipv4Addr::from_str(&i),
+            Ok(i) => Ipv4Addr::from_str(i),
             _ => {
                 continue;
             }
@@ -243,7 +246,7 @@ pub struct Message {
     pub interface: Interface,
 }
 
-const CMSG_HEADER_SIZE: usize = mem::size_of::<WSACMSGHDR>();
+const CMSG_HEADER_SIZE: usize = mem::size_of::<CMSGHDR>();
 const PKTINFO_DATA_SIZE: usize = mem::size_of::<IN_PKTINFO>();
 const CONTROL_PKTINFO_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFO_DATA_SIZE;
 
@@ -277,13 +280,13 @@ impl MulticastSocket {
     pub fn receive(&self) -> io::Result<Message> {
         let mut data_buffer = vec![0; self.buffer_size];
         let mut data = WSABUF {
-            buf: data_buffer.as_mut_ptr(),
+            buf: PSTR(data_buffer.as_mut_ptr()),
             len: data_buffer.len() as u32,
         };
 
         let mut control_buffer = [0; CONTROL_PKTINFO_BUFFER_SIZE];
         let control = WSABUF {
-            buf: control_buffer.as_mut_ptr(),
+            buf: PSTR(control_buffer.as_mut_ptr()),
             len: control_buffer.len() as u32,
         };
 
@@ -301,7 +304,7 @@ impl MulticastSocket {
         let r = {
             unsafe {
                 (self.wsarecvmsg)(
-                    self.socket.as_raw_socket() as _,
+                    SOCKET(self.socket.as_raw_socket() as _),
                     &mut wsa_msg,
                     &mut read_bytes,
                     ptr::null_mut(),
@@ -316,7 +319,7 @@ impl MulticastSocket {
 
         let origin_address = unsafe {
             socket2::SockAddr::from_raw_parts(
-                &origin_address,
+                &origin_address as *const _ as *const _,
                 mem::size_of_val(&origin_address) as i32,
             )
         }
@@ -330,19 +333,18 @@ impl MulticastSocket {
         let mut interface = Interface::Default;
         // Ensures that the control buffer is the size of the CSMG_HEADER + the pkinto data
         if control.len as usize == CONTROL_PKTINFO_BUFFER_SIZE {
-            let cmsg_header: WSACMSGHDR = unsafe { ptr::read_unaligned(control.buf as *const _) }; // TODO fix clippy warning without breaking the code
-            if cmsg_header.cmsg_level == IPPROTO_IP && cmsg_header.cmsg_type == IP_PKTINFO {
-                let interface_info: IN_PKTINFO =
-                    unsafe { ptr::read_unaligned(control.buf.add(CMSG_HEADER_SIZE) as *const _) }; // TODO fix clippy warning without breaking the code
+            let cmsg_header: CMSGHDR =
+                unsafe { ptr::read_unaligned(control.buf.as_ptr() as *const _) }; // TODO fix clippy warning without breaking the code
+            if cmsg_header.cmsg_level == IPPROTO_IP.0 && cmsg_header.cmsg_type == IP_PKTINFO {
+                let interface_info: IN_PKTINFO = unsafe {
+                    ptr::read_unaligned(control.buf.as_ptr().add(CMSG_HEADER_SIZE) as *const _)
+                }; // TODO fix clippy warning without breaking the code
                 interface = Interface::Index(interface_info.ipi_ifindex);
             };
         };
 
         Ok(Message {
-            data: data_buffer[0..read_bytes as _]
-                .iter()
-                .map(|i| *i as u8)
-                .collect(),
+            data: data_buffer[0..read_bytes as _].to_vec(),
             origin_address,
             interface,
         })
@@ -366,15 +368,15 @@ impl MulticastSocket {
         };
 
         let mut data = WSABUF {
-            buf: buf.as_ptr() as *mut _,
-            len: buf.len() as _,
+            buf: PSTR(buf.as_ptr() as *mut _),
+            len: buf.len() as u32,
         };
 
         let mut control_buffer = [0; CONTROL_PKTINFO_BUFFER_SIZE];
         let control = if let Some(pkt_info) = pkt_info {
             let hdr = CMSGHDR {
                 cmsg_len: CONTROL_PKTINFO_BUFFER_SIZE,
-                cmsg_level: IPPROTO_IP,
+                cmsg_level: IPPROTO_IP.0,
                 cmsg_type: IP_PKTINFO,
             };
             unsafe {
@@ -390,12 +392,12 @@ impl MulticastSocket {
                 )
             };
             WSABUF {
-                buf: control_buffer.as_mut_ptr(),
+                buf: PSTR(control_buffer.as_mut_ptr()),
                 len: control_buffer.len() as _,
             }
         } else {
             WSABUF {
-                buf: [].as_mut_ptr(),
+                buf: PSTR([].as_mut_ptr()),
                 len: 0,
             }
         };
@@ -411,10 +413,12 @@ impl MulticastSocket {
             dwFlags: 0,
         };
 
+        println!("{wsa_msg:?}");
+
         let mut sent_bytes = 0;
         let r = unsafe {
             (self.wsasendmsg)(
-                self.socket.as_raw_socket() as _,
+                SOCKET(self.socket.as_raw_socket() as _),
                 &mut wsa_msg,
                 0,
                 &mut sent_bytes,
@@ -423,6 +427,7 @@ impl MulticastSocket {
             )
         };
         if r != 0 {
+            println!("fail here");
             return Err(io::Error::last_os_error());
         }
 
@@ -431,16 +436,17 @@ impl MulticastSocket {
 
     pub fn broadcast(&self, buf: &[u8]) -> io::Result<()> {
         for interface in self.interfaces.values() {
+            println!("{interface:?}");
             self.send(buf, &Interface::Ip(*interface))?;
         }
         Ok(())
     }
 }
 
-fn to_s_addr(addr: &Ipv4Addr) -> in_addr_S_un {
+fn to_s_addr(addr: &Ipv4Addr) -> IN_ADDR_0 {
     let octets = addr.octets();
     let res = u32::from_ne_bytes(octets);
-    let mut new_addr: in_addr_S_un = unsafe { mem::zeroed() };
-    unsafe { *(new_addr.S_addr_mut()) = res };
+    let mut new_addr: IN_ADDR_0 = Default::default();
+    new_addr.S_addr = res;
     new_addr
 }
